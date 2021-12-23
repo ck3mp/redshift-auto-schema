@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import psycopg2 as pg
-import pandas as pd
-import numpy as np
 import re
 from datetime import datetime
-from dateutil import parser
 from typing import List
 
+import numpy as np
+import pandas as pd
+from awswrangler.catalog import sanitize_dataframe_columns_names
+from dateutil import parser
 
-class RedshiftAutoSchema():
+
+class RedshiftAutoSchema:
 
     """RedshiftAutoSchema takes a delimited flat file or parquet file as input and infers the appropriate Redshift data type for each column.
     This class provides functions that allow for the automatic generation and validation of table schemas (and basic permissioning) in Redshift.
@@ -44,22 +45,23 @@ class RedshiftAutoSchema():
         column (List[str]): Optional list of column names
     """
 
-    def __init__(self,
-                 schema: str,
-                 table: str,
-                 file: str = None,
-                 export_field_name: str = None,
-                 export_field_type: str = None,
-                 primary_key: str = None,
-                 dist_key: str = None,
-                 sort_key: str = None,
-                 delimiter: str = '|',
-                 quotechar: str = '"',
-                 encoding: str = None,
-                 conn: pg.extensions.connection = None,
-                 default_group: str = 'dbreader',
-                 file_df: pd.core.frame.DataFrame = None,
-                 columns: List[str] = None) -> None:
+    def __init__(
+        self,
+        schema: str,
+        table: str,
+        file: str = None,
+        export_field_name: str = None,
+        export_field_type: str = None,
+        primary_key: str = None,
+        dist_key: str = None,
+        sort_key: str = None,
+        delimiter: str = "|",
+        quotechar: str = '"',
+        encoding: str = None,
+        default_group: str = "dbreader",
+        file_df: pd.core.frame.DataFrame = None,
+        columns: List[str] = None,
+    ) -> None:
         assert file or not file_df.empty
         self.file = file
         self.schema = schema
@@ -72,7 +74,6 @@ class RedshiftAutoSchema():
         self.delimiter = delimiter
         self.quotechar = quotechar
         self.encoding = encoding
-        self.conn = conn
         self.default_group = default_group
         self.metadata = None
         self.columns = columns
@@ -80,8 +81,7 @@ class RedshiftAutoSchema():
         self.file_df = file_df
 
     def get_column_list(self) -> list:
-        """Returns column list based on header of file.
-        """
+        """Returns column list based on header of file."""
         if self.columns is None:
             if self.file_df is None:
                 self._load_file(self.file, True)
@@ -89,38 +89,6 @@ class RedshiftAutoSchema():
             self.columns = [col for col in self.file_df.columns]
 
         return self.columns
-
-    def check_schema_existence(self) -> bool:
-        """Checks Redshift for the existence of a schema.
-
-        Returns:
-            bool: True if the schema exists, False otherwise
-
-        Raises:
-            Exception: This function requires a Redshift connection be passed into class conn parameter.
-        """
-        if self.conn:
-            with self.conn.cursor() as cur:
-                cur.execute(f"SELECT 1 FROM pg_namespace WHERE nspname = '{self.schema}';")
-                return True if cur.rowcount != 0 else False
-        else:
-            raise Exception("Conn must be set to a valid Redshift connection.")
-
-    def check_table_existence(self) -> bool:
-        """Checks Redshift for the existence of a table.
-
-        Returns:
-            bool: True if the table exists, False otherwise
-
-        Raises:
-            Exception: This function requires a Redshift connection be passed into class conn parameter.
-        """
-        if self.conn:
-            with self.conn.cursor() as cur:
-                cur.execute(f"SELECT 1 FROM pg_tables WHERE schemaname = '{self.schema}' AND tablename = '{self.table}' UNION SELECT 1 FROM pg_views WHERE schemaname = '{self.schema}' AND viewname = '{self.table}' LIMIT 1;")
-                return True if cur.rowcount != 0 else False
-        else:
-            raise Exception("Conn must be set to a valid Redshift connection.")
 
     def generate_schema_ddl(self) -> str:
         """Returns a SQL statement that creates a Redshift schema.
@@ -150,10 +118,16 @@ class RedshiftAutoSchema():
                 return None
 
         metadata = self.metadata.copy()
-        metadata.loc[metadata.proposed_type == 'notype', 'proposed_type'] = 'varchar(256)'
-        metadata['index'][0] = '"' + str(metadata['index'][0]) + '"'
-        metadata['index'][1:] = ', "' + metadata['index'][1:].astype(str) + '"'
-        columns = re.sub(' +', ' ', metadata[['index', 'proposed_type']].to_string(header=False, index=False))
+        metadata.loc[
+            metadata.proposed_type == "notype", "proposed_type"
+        ] = "varchar(256)"
+        metadata["index"][0] = '"' + str(metadata["index"][0]) + '"'
+        metadata["index"][1:] = ', "' + metadata["index"][1:].astype(str) + '"'
+        columns = re.sub(
+            " +",
+            " ",
+            metadata[["index", "proposed_type"]].to_string(header=False, index=False),
+        )
         ddl = f"CREATE TABLE {self.schema}.{self.table} (\n{columns}\n"
 
         if self.export_field_name and self.export_field_type:
@@ -162,7 +136,7 @@ class RedshiftAutoSchema():
         if self.primary_key:
             ddl += f" , PRIMARY KEY ({self.primary_key})\n"
 
-        ddl += ')\n'
+        ddl += ")\n"
 
         if self.dist_key:
             ddl += f"DISTKEY ({self.dist_key})\n"
@@ -174,67 +148,32 @@ class RedshiftAutoSchema():
 
         return ddl
 
-    def generate_column_ddl(self) -> str:
-        """Returns a SQL statement that adds missing column(s) to a table.
-
-        Returns:
-            str: Column DDL
-        """
-        if self.diff is None:
-            self.evaluate_table_ddl_diffs()
-
-        if 'reason' not in self.diff.columns:
-            return None
-        elif not self.diff[self.diff.reason == 'MISSING'].empty:
-            missing = self.diff[['field', 'proposed_type']][self.diff.reason == 'MISSING']
-            return re.sub(' +', ' ', (f'ALTER TABLE {self.schema}.{self.table} ADD COLUMN ' + missing['field'] + ' ' + missing['proposed_type'] + ';').to_string(header=False, index=False))
-        else:
-            return None
-
     def generate_table_permissions(self) -> str:
         """Returns a SQL statement that grants table read access to the default group.
 
         Returns:
             str: Table permissions DDL
         """
-        return f"GRANT SELECT ON {self.schema}.{self.table} TO GROUP {self.default_group};"
-
-    def evaluate_table_ddl_diffs(self) -> pd.core.frame.DataFrame:
-        """If table exists in Redshift, returns a dataframe containing differences between proposed and existing table DDL. Return an empty dataframe if there are no diffs.
-
-        Returns:
-            pd.core.frame.DataFrame: Dataframe with diffs (empty dataframe with no diffs)
-        """
-        if self.conn is None:
-            raise Exception("Conn must be set to a valid Redshift connection.")
-
-        if self.metadata is None:
-            self._generate_table_metadata()
-
-        proposed_df = self.metadata.copy()
-        deployed_df = pd.read_sql(f"""SELECT "column_name" AS index, "udt_name" || CASE WHEN character_maximum_length IS NOT NULL THEN '(' || CAST(character_maximum_length AS VARCHAR) || ')' ELSE '' END AS deployed_type
-                                      FROM information_schema.columns WHERE table_schema = '{self.schema}' AND table_name = '{self.table}' ORDER BY ordinal_position;""", con=self.conn)
-        combined_df = pd.merge(proposed_df, deployed_df, how='outer', on='index')
-        combined_df['reason'] = combined_df.apply(lambda x: 'TYPE MISMATCH' if (self._classify_type(x['proposed_type']) != self._classify_type(x['deployed_type'])) else np.NaN, axis=1)
-        combined_df.loc[combined_df.proposed_type.notnull() & combined_df.deployed_type.isnull(), 'reason'] = 'MISSING'
-        combined_df.loc[combined_df.proposed_type.isnull() & combined_df.deployed_type.notnull(), 'reason'] = 'DEPRECATED'
-        combined_df.rename(columns={'index': 'field'}, inplace=True)
-        combined_df = combined_df[combined_df.proposed_type != 'notype']
-        combined_df = combined_df[['field', 'proposed_type', 'deployed_type', 'reason']].copy()
-        self.diff = combined_df[combined_df['reason'].notnull()]
-        return self.diff
+        return (
+            f"GRANT SELECT ON {self.schema}.{self.table} TO GROUP {self.default_group};"
+        )
 
     def _load_file(self, path: str, low_memory: bool = False) -> None:
-        if 'parquet' in self.file.lower():
+        if "parquet" in self.file.lower():
             self.file_df = pd.read_parquet(self.file)
         else:
-            self.file_df = pd.read_csv(self.file, sep=self.delimiter, quotechar=self.quotechar, encoding=self.encoding, low_memory=low_memory)
+            self.file_df = pd.read_csv(
+                self.file,
+                sep=self.delimiter,
+                quotechar=self.quotechar,
+                encoding=self.encoding,
+                low_memory=low_memory,
+            )
 
-        self.file_df.columns = self.file_df.columns.str.replace(".", "_")
+        self.file_df = sanitize_dataframe_columns_names(self.file_df)
 
     def _generate_table_metadata(self) -> None:
-        """Generates metadata based on contents of file.
-        """
+        """Generates metadata based on contents of file."""
         pd.set_option("display.max_colwidth", 10000)
 
         if self.file_df is None:
@@ -249,10 +188,15 @@ class RedshiftAutoSchema():
         else:
             self.file_df.columns = self.columns
 
-        metadata = self.file_df.dtypes.to_frame('pandas_type')
+        metadata = self.file_df.dtypes.to_frame("pandas_type")
         metadata.reset_index(level=0, inplace=True)
-        metadata['proposed_type'] = ''
-        metadata['proposed_type'] = metadata.apply(lambda col: self._evaluate_type(col, identifier=True) if str(col[0]).endswith('_id') else self._evaluate_type(col), axis=1)
+        metadata["proposed_type"] = ""
+        metadata["proposed_type"] = metadata.apply(
+            lambda col: self._evaluate_type(col, identifier=True)
+            if str(col[0]).endswith("_id")
+            else self._evaluate_type(col),
+            axis=1,
+        )
         self.metadata = metadata
 
     def _classify_type(self, datatype: str) -> int:
@@ -262,36 +206,50 @@ class RedshiftAutoSchema():
             int: Value for the data type set.
         """
         datatype = str(datatype).lower().strip()
-        if datatype in ('smallint', 'int2'):
+        if datatype in ("smallint", "int2"):
             return 1
-        elif datatype in ('integer', 'int', 'int4'):
+        elif datatype in ("integer", "int", "int4"):
             return 2
-        elif datatype in ('bigint', 'int8'):
+        elif datatype in ("bigint", "int8"):
             return 3
-        elif datatype in ('decimal', 'numeric'):
+        elif datatype in ("decimal", "numeric"):
             return 4
-        elif datatype in ('real', 'float'):
+        elif datatype in ("real", "float"):
             return 5
-        elif datatype in ('double precision', 'float8', 'float'):
+        elif datatype in ("double precision", "float8", "float"):
             return 6
-        elif datatype in ('boolean', 'bool'):
+        elif datatype in ("boolean", "bool"):
             return 7
-        elif datatype in ('char', 'character', 'nchar', 'bpchar'):
+        elif datatype in ("char", "character", "nchar", "bpchar"):
             return 8
-        elif datatype in ('varchar', 'varchar(256)', 'character varying', 'character varying(256)', 'nvarchar', 'nvarchar(256)', 'text'):
+        elif datatype in (
+            "varchar",
+            "varchar(256)",
+            "character varying",
+            "character varying(256)",
+            "nvarchar",
+            "nvarchar(256)",
+            "text",
+        ):
             return 9
-        elif datatype in ('varchar(65535)', 'character varying(65535)', 'nvarchar(65535)'):
+        elif datatype in (
+            "varchar(65535)",
+            "character varying(65535)",
+            "nvarchar(65535)",
+        ):
             return 10
-        elif datatype in ('date'):
+        elif datatype in ("date"):
             return 11
-        elif datatype in ('timestamp', 'timestamp without time zone'):
+        elif datatype in ("timestamp", "timestamp without time zone"):
             return 12
-        elif datatype in ('timestamptz', 'timestamp with time zone'):
+        elif datatype in ("timestamptz", "timestamp with time zone"):
             return 13
         else:
             return 0
 
-    def _evaluate_type(self, metadata: pd.core.series.Series, identifier: bool = False) -> str:
+    def _evaluate_type(
+        self, metadata: pd.core.series.Series, identifier: bool = False
+    ) -> str:
         """Takes table column metadata as input and infers a Redshift data type from the data.
 
         Args:
@@ -304,36 +262,52 @@ class RedshiftAutoSchema():
         column = self.file_df[name]
 
         if column.isnull().all():
-            return 'notype'
+            return "notype"
         else:
             column = column[column.notnull()]
 
-            if all(str(x).lower() in ["true", "false", "t", "f", "0", "1"] for x in column.unique()) and identifier is False:
-                return 'bool'
+            if (
+                all(
+                    str(x).lower() in ["true", "false", "t", "f", "0", "1"]
+                    for x in column.unique()
+                )
+                and identifier is False
+            ):
+                return "bool"
             else:
                 try:
                     column.astype(float)
                     try:
-                        if np.array_equal(column.fillna(True).astype(float), column.fillna(True).astype(int)):
-                            if column.max() <= 2147483647 and column.min() >= -2147483648:
-                                return 'int4'
+                        if np.array_equal(
+                            column.fillna(True).astype(float),
+                            column.fillna(True).astype(int),
+                        ):
+                            if (
+                                column.max() <= 2147483647
+                                and column.min() >= -2147483648
+                            ):
+                                return "int4"
                             else:
-                                return 'int8'
+                                return "int8"
                         else:
-                            return 'float8'
+                            return "float8"
                     except TypeError:
-                        return 'float8'
+                        return "float8"
                 except (TypeError, ValueError, OverflowError):
                     try:
                         date_parse = pd.to_datetime(column, infer_datetime_format=True)
-                        if not all(parser.parse(str(x), default=datetime(1900, 1, 1)) == parser.parse(str(x)) for x in column.unique()):
-                            return 'varchar(256)'
+                        if not all(
+                            parser.parse(str(x), default=datetime(1900, 1, 1))
+                            == parser.parse(str(x))
+                            for x in column.unique()
+                        ):
+                            return "varchar(256)"
                         elif all(date_parse == date_parse.dt.normalize()):
-                            return 'date'
+                            return "date"
                         else:
-                            return 'timestamp'
+                            return "timestamp"
                     except (TypeError, ValueError, OverflowError):
                         if column.astype(str).map(len).max() <= 240:
-                            return 'varchar(256)'
+                            return "varchar(256)"
                         else:
-                            return 'varchar(65535)'
+                            return "varchar(65535)"
